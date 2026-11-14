@@ -1,0 +1,41 @@
+# The @sasjs/release live contract, run against this repository.
+#
+# It lives here rather than in sasjs/release because this repository's own token
+# already has contents: write here, so the check needs no secret at all - and a
+# release tool that needed a long-lived token to test itself would be arguing
+# against the thing it exists for.
+#
+# What it proves: that the forge still behaves the way the tool's stubs believe -
+# a draft hidden from the by-tag endpoint, upload_url with its name/label
+# template, a tag created only when a draft is published, and a re-run finishing
+# rather than duplicating. It creates a draft release, uploads an asset, publishes
+# it, re-runs, then deletes both again.
+name: Release tool live contract
+
+on:
+  schedule:
+    - cron: '41 5 * * 1' # Mondays, before the week's work
+  workflow_dispatch:
+
+permissions:
+  contents: write # it creates and deletes a release and a tag here
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The tool, from sasjs/release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: sasjs/release
+          ref: main
+          path: tool
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: The forge still behaves the way the stubs believe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node tool/scripts/live-contract.mjs --repo ${{ github.repository }}
