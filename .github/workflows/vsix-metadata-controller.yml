@@ -1,0 +1,35 @@
+name: VSIX witness-only rerun controller
+on:
+  push:
+    branches: [experiment/vsix-metadata-probe-20261123]
+permissions: {}
+jobs:
+  control:
+    runs-on: ubuntu-latest
+    permissions: {actions: write}
+    steps:
+      - name: Rerun witness and dependents only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for i in {1..90}; do
+            data=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/vsix-metadata-probe.yml/runs?branch=experiment%2Fvsix-metadata-probe-20261123&event=push&per_page=100")
+            count=$(jq --arg sha "$GITHUB_SHA" '[.workflow_runs[] | select(.head_sha == $sha)] | length' <<< "$data")
+            if [[ "$count" == 1 ]]; then
+              row=$(jq -c --arg sha "$GITHUB_SHA" '.workflow_runs[] | select(.head_sha == $sha)' <<< "$data")
+              if [[ $(jq -r .status <<< "$row") == completed ]]; then
+                [[ $(jq -r .conclusion <<< "$row") == success && $(jq -r .run_attempt <<< "$row") == 1 ]]
+                id=$(jq -r .id <<< "$row")
+                jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/attempts/1/jobs?per_page=100")
+                [[ $(jq '[.jobs[] | select(.name == "witness" and .conclusion == "success")] | length' <<< "$jobs") == 1 ]]
+                witness=$(jq -r '.jobs[] | select(.name == "witness") | .id' <<< "$jobs")
+                [[ "$witness" =~ ^[1-9][0-9]*$ ]]
+                gh api --method POST "repos/$GITHUB_REPOSITORY/actions/jobs/$witness/rerun"
+                echo "Requested witness-only rerun: run=$id job=$witness"
+                exit 0
+              fi
+            elif [[ "$count" != 0 ]]; then echo 'Ambiguous runs'; exit 1; fi
+            sleep 5
+          done
+          echo 'Timed out'; exit 1

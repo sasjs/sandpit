@@ -1,0 +1,86 @@
+name: VSIX artifact metadata adversarial probe
+on:
+  push:
+    branches: [experiment/vsix-metadata-probe-20261123]
+permissions: {}
+jobs:
+  producer:
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      claimed_attempt: ${{ steps.forge.outputs.attempt }}
+      selected_id: ${{ steps.wrong.outputs.artifact-id }}
+      real_id: ${{ steps.right.outputs.artifact-id }}
+    steps:
+      - name: Create synthetic legitimate and substituted payloads
+        run: |
+          mkdir -p right wrong
+          printf 'legitimate synthetic payload\n' > right/payload.txt
+          printf 'substituted synthetic payload\n' > wrong/payload.txt
+      - id: forge
+        run: printf 'attempt=2\n' >> "$GITHUB_OUTPUT"
+      - id: right
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: synthetic-real-${{ github.run_id }}-${{ github.run_attempt }}
+          path: right/payload.txt
+          retention-days: 1
+          if-no-files-found: error
+      - id: wrong
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          # Malicious producer pre-creates a name falsely asserting future attempt 2.
+          name: synthetic-claimed-attempt-2-${{ github.run_id }}
+          path: wrong/payload.txt
+          retention-days: 1
+          if-no-files-found: error
+  witness:
+    needs: producer
+    runs-on: ubuntu-latest
+    permissions: {actions: read}
+    outputs:
+      attempt: ${{ steps.witness.outputs.attempt }}
+    steps:
+      - id: witness
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ID: ${{ needs.producer.outputs.selected_id }}
+          REAL: ${{ needs.producer.outputs.real_id }}
+        run: |
+          set -euo pipefail
+          printf 'attempt=%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+          [[ "$ID" =~ ^[1-9][0-9]*$ && "$REAL" =~ ^[1-9][0-9]*$ && "$ID" != "$REAL" ]]
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT")
+          artifact=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ID")
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100")
+          printf 'attempt API: '; jq -c '{id,run_attempt,run_started_at,created_at}' <<< "$run"
+          printf 'selected API: '; jq -c '{id,name,digest,created_at,updated_at,workflow_run}' <<< "$artifact"
+          printf 'producer API: '; jq -c '.jobs[] | select(.name=="producer") | {id,name,started_at,completed_at,conclusion}' <<< "$jobs"
+          jq -e --argjson id "$ID" --argjson run "$GITHUB_RUN_ID" --arg sha "$GITHUB_SHA" '.id == $id and .expired == false and .workflow_run.id == $run and .workflow_run.head_sha == $sha and (.digest | test("^sha256:[0-9a-f]{64}$"))' <<< "$artifact" > /dev/null
+          echo 'SAME-RUN API ID/DIGEST CHECK ACCEPTS PRODUCER-SELECTED SUBSTITUTION: not proof of intended payload'
+          if [[ "$GITHUB_RUN_ATTEMPT" == 2 ]]; then
+            started=$(jq -r .run_started_at <<< "$run")
+            created=$(jq -r .created_at <<< "$artifact")
+            if [[ "$created" < "$started" ]]; then
+              echo "CANDIDATE TIMESTAMP CHECK REJECTED old artifact: $created < $started"
+            else
+              echo 'ERROR expected old artifact to precede rerun'; exit 1
+            fi
+          fi
+  consumer:
+    needs: [producer, witness]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Expose old guard without signing
+        env:
+          CLAIM: ${{ needs.producer.outputs.claimed_attempt }}
+          WITNESS: ${{ needs.witness.outputs.attempt }}
+        run: |
+          set -euo pipefail
+          printf 'producer-claimed=%s witness=%s actual=%s\n' "$CLAIM" "$WITNESS" "$GITHUB_RUN_ATTEMPT"
+          if [[ "$CLAIM" == "$GITHUB_RUN_ATTEMPT" && "$WITNESS" == "$GITHUB_RUN_ATTEMPT" ]]; then
+            echo 'OLD GUARD ACCEPTS inherited producer data; NO SIGNING PERFORMED'
+          else
+            echo 'OLD GUARD REJECTS'
+          fi
