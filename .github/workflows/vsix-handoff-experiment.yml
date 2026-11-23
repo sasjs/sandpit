@@ -1,0 +1,128 @@
+name: VSIX handoff sandbox experiment
+on:
+  push:
+    branches: [experiment/vsix-handoff-20261123]
+permissions: {}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions: {contents: read}
+    outputs:
+      run: ${{ steps.meta.outputs.run }}
+      attempt: ${{ steps.meta.outputs.attempt }}
+      sha: ${{ steps.meta.outputs.sha }}
+      digest: ${{ steps.meta.outputs.digest }}
+      good_id: ${{ steps.good.outputs.artifact-id }}
+      bad_id: ${{ steps.bad.outputs.artifact-id }}
+    steps:
+      - name: Build explicitly synthetic payloads
+        run: |
+          mkdir -p good bad
+          printf 'synthetic sandbox build from %s\n' "$GITHUB_SHA" > good/payload.txt
+          printf 'synthetic wrong artifact from %s\n' "$GITHUB_SHA" > bad/payload.txt
+      - id: meta
+        run: |
+          printf 'run=%s\nattempt=%s\nsha=%s\ndigest=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" "$(sha256sum good/payload.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - id: good
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: synthetic-good-${{ github.run_id }}-${{ github.run_attempt }}
+          path: good/payload.txt
+          if-no-files-found: error
+          retention-days: 1
+      - id: bad
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: synthetic-wrong-${{ github.run_id }}-${{ github.run_attempt }}
+          path: bad/payload.txt
+          if-no-files-found: error
+          retention-days: 1
+  sign:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions: {actions: read, contents: read, id-token: write, attestations: write}
+    steps:
+      - name: Enforce producer identity and attempt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRODUCER_RUN: ${{ needs.build.outputs.run }}
+          PRODUCER_ATTEMPT: ${{ needs.build.outputs.attempt }}
+          PRODUCER_SHA: ${{ needs.build.outputs.sha }}
+          ARTIFACT_ID: ${{ needs.build.outputs.good_id }}
+        run: |
+          set -euo pipefail
+          [[ "$PRODUCER_RUN" == "$GITHUB_RUN_ID" && "$PRODUCER_ATTEMPT" == "$GITHUB_RUN_ATTEMPT" && "$PRODUCER_SHA" == "$GITHUB_SHA" && "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" | jq -e '[.jobs[] | select(.name == "build" and .status == "completed" and .conclusion == "success")] | length == 1'
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" | jq -e --argjson id "$ARTIFACT_ID" --argjson run "$GITHUB_RUN_ID" '.id == $id and .expired == false and .workflow_run.id == $run'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.build.outputs.good_id }}
+          path: accepted
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.build.outputs.bad_id }}
+          path: rejected
+          merge-multiple: true
+      - name: Verify good bytes and reject substituted wrong artifact
+        env:
+          EXPECTED: ${{ needs.build.outputs.digest }}
+          GOOD_ID: ${{ needs.build.outputs.good_id }}
+          BAD_ID: ${{ needs.build.outputs.bad_id }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED" =~ ^[0-9a-f]{64}$ && "$GOOD_ID" != "$BAD_ID" ]]
+          [[ "$(sha256sum accepted/payload.txt | cut -d' ' -f1)" == "$EXPECTED" ]]
+          if [[ "$(sha256sum rejected/payload.txt | cut -d' ' -f1)" == "$EXPECTED" ]]; then
+            echo 'ERROR wrong artifact accepted'; exit 1
+          fi
+          echo 'Wrong-artifact substitution rejected by content hash'
+      - name: Attest only real synthetic build output
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: accepted/payload.txt
+      - name: Verify exact signed payload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          gh attestation verify accepted/payload.txt --bundle "$BUNDLE" --repo "$GITHUB_REPOSITORY" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+          if gh attestation verify rejected/payload.txt --bundle "$BUNDLE" --repo "$GITHUB_REPOSITORY" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners; then
+            echo 'ERROR wrong payload verified'; exit 1
+          fi
+          echo 'Wrong payload rejected cryptographically'
+  retry-sign:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions: {actions: read, contents: read, id-token: write, attestations: write}
+    steps:
+      - name: Deliberately fail only first attempt before signing
+        run: |
+          if [[ "$GITHUB_RUN_ATTEMPT" == 1 ]]; then echo 'intentional first-attempt failure'; exit 1; fi
+      - name: Fail closed on old producer attempt before signing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRODUCER_RUN: ${{ needs.build.outputs.run }}
+          PRODUCER_ATTEMPT: ${{ needs.build.outputs.attempt }}
+          PRODUCER_SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          set -euo pipefail
+          printf 'producer run=%s attempt=%s consumer run=%s attempt=%s\n' "$PRODUCER_RUN" "$PRODUCER_ATTEMPT" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          if [[ "$PRODUCER_RUN" != "$GITHUB_RUN_ID" || "$PRODUCER_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" || "$PRODUCER_SHA" != "$GITHUB_SHA" ]]; then
+            echo 'REFUSED old or mismatched producer before signing'; exit 1
+          fi
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" | jq -e '[.jobs[] | select(.name == "build" and .status == "completed" and .conclusion == "success")] | length == 1'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.build.outputs.good_id }}
+          path: accepted
+          merge-multiple: true
+      - name: Check exact content before signing
+        env:
+          EXPECTED: ${{ needs.build.outputs.digest }}
+        run: '[[ "$EXPECTED" =~ ^[0-9a-f]{64}$ && "$(sha256sum accepted/payload.txt | cut -d" " -f1)" == "$EXPECTED" ]]'
+      - name: Sign only if all checks pass
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: accepted/payload.txt

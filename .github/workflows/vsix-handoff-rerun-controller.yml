@@ -1,0 +1,35 @@
+name: VSIX sandbox failed-only rerun controller
+on:
+  push:
+    branches: [experiment/vsix-handoff-20261123]
+permissions: {}
+jobs:
+  rerun-experiment:
+    runs-on: ubuntu-latest
+    permissions: {actions: write, contents: read}
+    steps:
+      - name: Rerun only this commit's uniquely identified failed sandbox experiment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for i in {1..90}; do
+            data=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/vsix-handoff-experiment.yml/runs?branch=experiment%2Fvsix-handoff-20261123&event=push&per_page=100")
+            count=$(jq --arg sha "$GITHUB_SHA" '[.workflow_runs[] | select(.head_sha == $sha)] | length' <<< "$data")
+            if [[ "$count" == 1 ]]; then
+              row=$(jq -c --arg sha "$GITHUB_SHA" '.workflow_runs[] | select(.head_sha == $sha)' <<< "$data")
+              status=$(jq -r .status <<< "$row")
+              if [[ "$status" == completed ]]; then
+                [[ $(jq -r .conclusion <<< "$row") == failure && $(jq -r .run_attempt <<< "$row") == 1 ]]
+                id=$(jq -r .id <<< "$row")
+                [[ "$id" =~ ^[1-9][0-9]*$ && "$id" != "$GITHUB_RUN_ID" ]]
+                gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$id/rerun-failed-jobs"
+                echo "Requested failed-only rerun of experiment $id"
+                exit 0
+              fi
+            elif [[ "$count" != 0 ]]; then
+              echo 'Ambiguous experiment runs; refusing'; exit 1
+            fi
+            sleep 5
+          done
+          echo 'Experiment did not finish in time'; exit 1
