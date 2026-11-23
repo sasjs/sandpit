@@ -1,0 +1,29 @@
+name: Runner clock probe failed-only controller
+on:
+  push:
+    branches: [experiment/vsix-runner-clock-20261123]
+permissions: {}
+jobs:
+  controller:
+    runs-on: ubuntu-latest
+    permissions: {actions: write}
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for i in {1..90}; do
+            row=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/vsix-runner-clock.yml/runs?branch=experiment%2Fvsix-runner-clock-20261123&per_page=100" | jq -c --arg sha "$GITHUB_SHA" '.workflow_runs[] | select(.head_sha==$sha)')
+            if [[ -n "$row" && $(jq -r .status <<< "$row") == completed ]]; then
+              [[ $(jq -r .conclusion <<< "$row") == success && $(jq -r .run_attempt <<< "$row") == 1 ]]
+              id=$(jq -r .id <<< "$row")
+              jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/attempts/1/jobs?per_page=100")
+              [[ $(jq '[.jobs[]|select(.name=="check" and .conclusion=="success")]|length' <<< "$jobs") == 1 ]]
+              witness=$(jq -r '.jobs[]|select(.name=="check")|.id' <<< "$jobs")
+              gh api --method POST "repos/$GITHUB_REPOSITORY/actions/jobs/$witness/rerun"
+              echo "Reran check only: run $id job $witness"
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
