@@ -8,17 +8,21 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     steps:
-      - name: Shift hosted guest clock forward temporarily
+      - name: Shift hosted guest clock forward before next step
         run: |
           set -euo pipefail
           before=$(date -u +%s)
-          trap 'sudo date -u -s "@$before"; sudo systemctl start systemd-timesyncd || true' EXIT
-          sudo systemctl stop systemd-timesyncd || true
-          echo 'Setting guest UTC clock 10 minutes forward; restored in same step'
+          printf '%s\n' "$before" > /tmp/probe-original-clock
           sudo date -u -s "@$((before + 600))"
           date -u
+      - name: Execute with advanced clock and restore guest time
+        run: |
+          set -euo pipefail
+          before=$(< /tmp/probe-original-clock)
+          trap 'sudo date -u -s "@$before"' EXIT
+          date -u
           sleep 2
-      - name: No payload, report restored time
+      - name: Report restored time
         run: date -u
   check:
     needs: producer
