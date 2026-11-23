@@ -1,0 +1,74 @@
+name: VSIX execution freshness adversarial sandbox
+on:
+  push:
+    branches: [experiment/vsix-attempt-freshness-20261123]
+permissions: {}
+jobs:
+  producer:
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      claimed_attempt: ${{ steps.forge.outputs.attempt }}
+      selected_id: ${{ steps.substituted.outputs.artifact-id }}
+      correct_id: ${{ steps.correct.outputs.artifact-id }}
+    steps:
+      - name: Forge metadata and substitute payload
+        id: forge
+        run: |
+          set -euo pipefail
+          mkdir correct wrong
+          printf 'intended synthetic build\n' > correct/payload.txt
+          printf 'substituted synthetic payload\n' > wrong/payload.txt
+          printf 'attempt=2\n' >> "$GITHUB_OUTPUT"
+          sha256sum correct/payload.txt wrong/payload.txt
+      - id: correct
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fresh-correct-${{ github.run_id }}-${{ github.run_attempt }}
+          path: correct/payload.txt
+          retention-days: 1
+          if-no-files-found: error
+      - id: substituted
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fresh-selected-${{ github.run_id }}-${{ github.run_attempt }}
+          path: wrong/payload.txt
+          retention-days: 1
+          if-no-files-found: error
+  witness:
+    needs: producer
+    runs-on: ubuntu-latest
+    permissions: {actions: read}
+    steps:
+      - name: Observe actual API metadata, forge and archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAIM: ${{ needs.producer.outputs.claimed_attempt }}
+          SELECTED: ${{ needs.producer.outputs.selected_id }}
+          CORRECT: ${{ needs.producer.outputs.correct_id }}
+        run: |
+          set -euo pipefail
+          [[ "$SELECTED" =~ ^[1-9][0-9]*$ && "$CORRECT" =~ ^[1-9][0-9]*$ && "$SELECTED" != "$CORRECT" ]]
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT")
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100")
+          artifact=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$SELECTED")
+          jq -e --argjson id "$SELECTED" --argjson run "$GITHUB_RUN_ID" --arg sha "$GITHUB_SHA" '.id == $id and .expired == false and .workflow_run.id == $run and .workflow_run.head_sha == $sha and (.digest | test("^sha256:[0-9a-f]{64}$"))' <<< "$artifact" >/dev/null
+          [[ $(jq '[.jobs[] | select(.name == "producer" and .conclusion == "success")] | length' <<< "$jobs") == 1 ]]
+          printf 'run API: '; jq -c '{id,run_attempt,run_started_at,created_at,head_sha}' <<< "$run"
+          printf 'producer API: '; jq -c '.jobs[] | select(.name=="producer") | {id,run_attempt,started_at,completed_at,conclusion,steps}' <<< "$jobs"
+          printf 'artifact API: '; jq -c '{id,name,created_at,updated_at,digest,workflow_run}' <<< "$artifact"
+          printf 'producer claim=%s current=%s correct-id=%s selected-id=%s\n' "$CLAIM" "$GITHUB_RUN_ATTEMPT" "$CORRECT" "$SELECTED"
+          start=$(jq -er .run_started_at <<< "$run")
+          producer_start=$(jq -er '.jobs[] | select(.name=="producer") | .started_at' <<< "$jobs")
+          producer_end=$(jq -er '.jobs[] | select(.name=="producer") | .completed_at' <<< "$jobs")
+          created=$(jq -er .created_at <<< "$artifact")
+          if [[ "$producer_start" > "$start" && "$created" > "$start" ]]; then echo 'CANDIDATE freshness PASS: not artifact origin or build proof'; else echo 'CANDIDATE freshness REFUSE: timestamps do not prove freshness'; fi
+          printf 'run_start=%s producer_start=%s producer_end=%s artifact_created=%s\n' "$start" "$producer_start" "$producer_end" "$created"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$SELECTED/zip" > artifact.zip
+          archive_sha=$(sha256sum artifact.zip | cut -d' ' -f1)
+          expected=$(jq -r '.digest | sub("^sha256:"; "")' <<< "$artifact")
+          [[ "$archive_sha" == "$expected" ]]
+          unzip -p artifact.zip payload.txt > selected.txt
+          printf 'archive sha256=%s selected payload sha256=' "$archive_sha"; sha256sum selected.txt
+          printf 'selected payload contents: '; cat selected.txt
+          if [[ "$GITHUB_RUN_ATTEMPT" == 1 ]]; then echo 'Intentional failure to trigger failed-only rerun'; exit 1; fi

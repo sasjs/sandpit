@@ -1,0 +1,43 @@
+name: VSIX freshness sandbox rerun controller
+on:
+  push:
+    branches: [experiment/vsix-attempt-freshness-20261123]
+permissions: {}
+jobs:
+  controller:
+    runs-on: ubuntu-latest
+    permissions: {actions: write}
+    steps:
+      - name: Trigger failed-only then full rerun
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for i in {1..90}; do
+            data=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/vsix-attempt-freshness.yml/runs?branch=experiment%2Fvsix-attempt-freshness-20261123&event=push&per_page=100")
+            count=$(jq --arg sha "$GITHUB_SHA" '[.workflow_runs[] | select(.head_sha == $sha)] | length' <<< "$data")
+            [[ "$count" == 0 || "$count" == 1 ]] || exit 1
+            if [[ "$count" == 1 ]]; then
+              row=$(jq -c --arg sha "$GITHUB_SHA" '.workflow_runs[] | select(.head_sha == $sha)' <<< "$data")
+              if [[ $(jq -r .status <<< "$row") == completed ]]; then
+                [[ $(jq -r .run_attempt <<< "$row") == 1 && $(jq -r .conclusion <<< "$row") == failure ]]
+                id=$(jq -r .id <<< "$row")
+                gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$id/rerun-failed-jobs"
+                echo "failed-only rerun requested: $id"
+                break
+              fi
+            fi
+            sleep 5
+          done
+          [[ "${id:-}" =~ ^[1-9][0-9]*$ ]]
+          for i in {1..90}; do
+            row=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id")
+            if [[ $(jq -r .run_attempt <<< "$row") == 2 && $(jq -r .status <<< "$row") == completed ]]; then
+              [[ $(jq -r .conclusion <<< "$row") == success ]]
+              gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$id/rerun"
+              echo "full rerun requested: $id"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'Timed out waiting for attempt 2'; exit 1
