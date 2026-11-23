@@ -1,0 +1,34 @@
+name: Runner clock adversarial timestamp probe
+on:
+  push:
+    branches: [experiment/vsix-runner-clock-20261123]
+permissions: {}
+jobs:
+  producer:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Shift hosted guest clock forward temporarily
+        run: |
+          set -euo pipefail
+          before=$(date -u +%s)
+          trap 'sudo date -u -s "@$before"; sudo systemctl start systemd-timesyncd || true' EXIT
+          sudo systemctl stop systemd-timesyncd || true
+          echo 'Setting guest UTC clock 10 minutes forward; restored in same step'
+          sudo date -u -s "@$((before + 600))"
+          date -u
+          sleep 2
+      - name: No payload, report restored time
+        run: date -u
+  check:
+    needs: producer
+    runs-on: ubuntu-latest
+    permissions: {actions: read}
+    steps:
+      - name: Check producer API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" --jq '{run_started_at,run_attempt}'
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" --jq '.jobs[]|select(.name=="producer")|{id,started_at,completed_at,steps}'
