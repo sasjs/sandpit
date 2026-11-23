@@ -84,3 +84,22 @@ jobs:
           else
             echo 'OLD GUARD REJECTS'
           fi
+  timestamp-gate:
+    needs: [producer, witness]
+    runs-on: ubuntu-latest
+    permissions: {actions: read}
+    steps:
+      - name: Experimental timestamp gate, no signing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ID: ${{ needs.producer.outputs.selected_id }}
+        run: |
+          set -euo pipefail
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT")
+          artifact=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ID")
+          started=$(jq -er '.run_started_at' <<< "$run")
+          created=$(jq -er '.created_at' <<< "$artifact")
+          if [[ "$created" < "$started" || "$created" == "$started" ]]; then
+            echo "REFUSED artifact timestamp $created not strictly after attempt start $started"; exit 1
+          fi
+          echo "Candidate timestamp gate accepted $created > $started (not proof of job identity)"
