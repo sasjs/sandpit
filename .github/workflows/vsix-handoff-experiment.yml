@@ -22,7 +22,8 @@ jobs:
           printf 'synthetic wrong artifact from %s\n' "$GITHUB_SHA" > bad/payload.txt
       - id: meta
         run: |
-          printf 'run=%s\nattempt=%s\nsha=%s\ndigest=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" "$(sha256sum good/payload.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          # Simulate attacker-controlled producer lying that its outputs are from attempt 2.
+          printf 'run=%s\nattempt=%s\nsha=%s\ndigest=%s\n' "$GITHUB_RUN_ID" 2 "$GITHUB_SHA" "$(sha256sum good/payload.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - id: good
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -37,8 +38,20 @@ jobs:
           path: bad/payload.txt
           if-no-files-found: error
           retention-days: 1
-  sign:
+  anchor:
     needs: build
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      run: ${{ steps.identity.outputs.run }}
+      attempt: ${{ steps.identity.outputs.attempt }}
+      sha: ${{ steps.identity.outputs.sha }}
+    steps:
+      - name: Capture context in an isolated trusted runner
+        id: identity
+        run: printf 'run=%s\nattempt=%s\nsha=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+  sign:
+    needs: [build, anchor]
     runs-on: ubuntu-latest
     permissions: {actions: read, contents: read, id-token: write, attestations: write}
     steps:
@@ -49,8 +62,12 @@ jobs:
           PRODUCER_ATTEMPT: ${{ needs.build.outputs.attempt }}
           PRODUCER_SHA: ${{ needs.build.outputs.sha }}
           ARTIFACT_ID: ${{ needs.build.outputs.good_id }}
+          ANCHOR_RUN: ${{ needs.anchor.outputs.run }}
+          ANCHOR_ATTEMPT: ${{ needs.anchor.outputs.attempt }}
+          ANCHOR_SHA: ${{ needs.anchor.outputs.sha }}
         run: |
           set -euo pipefail
+          [[ "$ANCHOR_RUN" == "$GITHUB_RUN_ID" && "$ANCHOR_ATTEMPT" == "$GITHUB_RUN_ATTEMPT" && "$ANCHOR_SHA" == "$GITHUB_SHA" ]] || { echo 'REFUSED old trusted anchor'; exit 1; }
           [[ "$PRODUCER_RUN" == "$GITHUB_RUN_ID" && "$PRODUCER_ATTEMPT" == "$GITHUB_RUN_ATTEMPT" && "$PRODUCER_SHA" == "$GITHUB_SHA" && "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
           gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" | jq -e '[.jobs[] | select(.name == "build" and .status == "completed" and .conclusion == "success")] | length == 1'
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" | jq -e --argjson id "$ARTIFACT_ID" --argjson run "$GITHUB_RUN_ID" '.id == $id and .expired == false and .workflow_run.id == $run'
@@ -93,7 +110,7 @@ jobs:
           fi
           echo 'Wrong payload rejected cryptographically'
   retry-sign:
-    needs: build
+    needs: [build, anchor]
     runs-on: ubuntu-latest
     permissions: {actions: read, contents: read, id-token: write, attestations: write}
     steps:
@@ -106,9 +123,15 @@ jobs:
           PRODUCER_RUN: ${{ needs.build.outputs.run }}
           PRODUCER_ATTEMPT: ${{ needs.build.outputs.attempt }}
           PRODUCER_SHA: ${{ needs.build.outputs.sha }}
+          ANCHOR_RUN: ${{ needs.anchor.outputs.run }}
+          ANCHOR_ATTEMPT: ${{ needs.anchor.outputs.attempt }}
+          ANCHOR_SHA: ${{ needs.anchor.outputs.sha }}
         run: |
           set -euo pipefail
-          printf 'producer run=%s attempt=%s consumer run=%s attempt=%s\n' "$PRODUCER_RUN" "$PRODUCER_ATTEMPT" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          printf 'producer run=%s attempt=%s trusted anchor run=%s attempt=%s consumer run=%s attempt=%s\n' "$PRODUCER_RUN" "$PRODUCER_ATTEMPT" "$ANCHOR_RUN" "$ANCHOR_ATTEMPT" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          if [[ "$ANCHOR_RUN" != "$GITHUB_RUN_ID" || "$ANCHOR_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" || "$ANCHOR_SHA" != "$GITHUB_SHA" ]]; then
+            echo 'REFUSED old trusted anchor before signing'; exit 1
+          fi
           if [[ "$PRODUCER_RUN" != "$GITHUB_RUN_ID" || "$PRODUCER_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" || "$PRODUCER_SHA" != "$GITHUB_SHA" ]]; then
             echo 'REFUSED old or mismatched producer before signing'; exit 1
           fi
