@@ -1,0 +1,190 @@
+# Hosted validation of the sasjs/vscode-extension release split (PR #503).
+#
+# Proves, with real GitHub infrastructure and a real attestation:
+#   1. an unarchived artifact's digest equals the file's SHA-256, so the signer
+#      can bind the bytes it downloads to the artifact record;
+#   2. the artifact API record (id, digest, workflow_run.id, head_sha) is enough
+#      for vsix-bind.mjs to accept the handoff;
+#   3. the pinned signer action produces a bundle that `gh attestation verify`
+#      accepts for the exact bytes with the release workflow's policy flags;
+#   4. tampered bytes are refused by the same check;
+#   5. a re-run (attempt 2) does not sign again: it reuses the attempt-1
+#      attestation, which is what makes a failed publish recoverable.
+#
+# Sandbox only: synthetic fixture, no release, no marketplace write.
+name: VSIX split validation
+
+on:
+  push:
+    branches:
+      - experiment/vsix-split-validation-20261124
+  workflow_dispatch:
+
+concurrency:
+  group: vsix-split-validation
+  cancel-in-progress: false
+
+permissions: read-all
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      digest: ${{ steps.digest.outputs.sha256 }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      vsix: ${{ steps.pack.outputs.vsix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Package a deterministic fixture
+        id: pack
+        run: |
+          VSIX="sandpit-extension-9.9.9.vsix"
+          printf 'fixture bytes for %s\n' "$GITHUB_SHA" > "$VSIX"
+          echo "vsix=$VSIX" >> "$GITHUB_OUTPUT"
+      - name: Digest the packaged extension
+        id: digest
+        env:
+          VSIX: ${{ steps.pack.outputs.vsix }}
+        run: echo "sha256=$(sha256sum "$VSIX" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Upload the extension as an artifact
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ${{ steps.pack.outputs.vsix }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    outputs:
+      mode: ${{ steps.bind.outputs.mode }}
+      bundle-artifact-id: ${{ steps.bundle.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download the VSIX artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: dist
+      - name: Bind the artifact to this run
+        id: bind
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.build.outputs.artifact-id }}
+          EXPECTED_DIGEST: ${{ needs.build.outputs.digest }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          VSIX: dist/${{ needs.build.outputs.vsix }}
+          METADATA: dist/artifact-metadata.json
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" > "$METADATA"
+          node .github/scripts/vsix-bind.mjs "$METADATA" "$VSIX"
+      - name: Attest the VSIX
+        if: steps.bind.outputs.mode == 'sign'
+        uses: sasjs/release/.github/actions/attest-assets@6bce05cbcd9364c7097f089ea6c9132978a500ca # v0.19.0
+        with:
+          version: 9.9.9
+          subject-path: dist/${{ needs.build.outputs.vsix }}
+          output-dir: dist
+      - name: Reuse the attestation already recorded for these bytes
+        if: steps.bind.outputs.mode == 'reuse'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VSIX: dist/${{ needs.build.outputs.vsix }}
+          ATTESTATIONS: dist/attestations.json
+          BUNDLE: dist/provenance-9.9.9.intoto.jsonl
+        run: |
+          gh attestation verify "$VSIX" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/vsix-split-validation.yml" \
+            --source-digest "$GITHUB_SHA" --source-ref refs/heads/experiment/vsix-split-validation-20261124 \
+            --deny-self-hosted-runners \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --format json > "$ATTESTATIONS"
+          node .github/scripts/select-attestation-bundle.mjs "$ATTESTATIONS" "$BUNDLE"
+      - name: Verify the bundle against the exact VSIX
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VSIX: dist/${{ needs.build.outputs.vsix }}
+          BUNDLE: dist/provenance-9.9.9.intoto.jsonl
+        run: |
+          test -s "$BUNDLE" || { echo '::error::no provenance bundle to verify; resolve manually'; exit 1; }
+          gh attestation verify "$VSIX" --bundle "$BUNDLE" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/vsix-split-validation.yml" \
+            --source-digest "$GITHUB_SHA" --source-ref refs/heads/experiment/vsix-split-validation-20261124 \
+            --deny-self-hosted-runners \
+            --predicate-type https://slsa.dev/provenance/v1
+      - name: Upload the provenance bundle
+        id: bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: dist/provenance-9.9.9.intoto.jsonl
+          archive: false
+          if-no-files-found: error
+          retention-days: 1
+
+  tamper:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download the VSIX artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: dist
+      - name: A substituted byte must not bind
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.build.outputs.artifact-id }}
+          EXPECTED_DIGEST: ${{ needs.build.outputs.digest }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          VSIX: dist/${{ needs.build.outputs.vsix }}
+          METADATA: dist/artifact-metadata.json
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" > "$METADATA"
+          printf 'x' >> "$VSIX"
+          if node .github/scripts/vsix-bind.mjs "$METADATA" "$VSIX"; then
+            echo '::error::a tampered artifact was accepted'
+            exit 1
+          fi
+          echo 'tampered bytes refused, as required'
+
+  check:
+    needs: [build, sign]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - name: Download the extension and its bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }},${{ needs.sign.outputs.bundle-artifact-id }}
+          path: dist
+          merge-multiple: true
+      - name: Verify build provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VSIX: dist/${{ needs.build.outputs.vsix }}
+          BUNDLE: dist/provenance-9.9.9.intoto.jsonl
+        run: |
+          test -s "$BUNDLE" || { echo '::error::no provenance bundle was uploaded; resolve manually'; exit 1; }
+          gh attestation verify "$VSIX" --bundle "$BUNDLE" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/vsix-split-validation.yml" \
+            --source-digest "$GITHUB_SHA" --source-ref refs/heads/experiment/vsix-split-validation-20261124 \
+            --deny-self-hosted-runners \
+            --predicate-type https://slsa.dev/provenance/v1
+          sha256sum "$VSIX"
+      - name: Report the decision taken by the signer
+        run: |
+          echo "signer mode was: ${{ needs.sign.outputs.mode }} on attempt ${{ github.run_attempt }}"
